@@ -6,7 +6,7 @@
 Système IoT sécurisé pour la **surveillance ECG à distance** avec :
 - Capteur ECG **AD8232** connecté à un **ESP32**
 - Chiffrement léger **ASCON-AEAD128** (Standard NIST 2025)
-- Filtre **IA intelligent** (Random Forest + Isolation Forest) intermédiaire
+- **Model AI** (Random Forest + Isolation Forest) intermédiaire
 - Application web full-stack (Backend Python + Frontend React)
 - Simulateur d'attaques 
 
