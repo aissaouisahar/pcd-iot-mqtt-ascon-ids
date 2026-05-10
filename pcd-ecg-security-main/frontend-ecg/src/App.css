@@ -1,0 +1,19 @@
+/* App.css — styles complémentaires SecureCare */
+/* Les styles principaux sont dans index.css    */
+
+.dashboard-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.ecg-chart-container {
+  height: 300px;
+  margin: 20px 0;
+}
+
+/* Couleurs stat par type */
+.stat-green { color: #16a34a; }
+.stat-red   { color: #ef4444; }
+.stat-amber { color: #f59e0b; }
+.stat-teal  { color: #0d9488; }

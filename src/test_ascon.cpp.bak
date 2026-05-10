@@ -1,0 +1,252 @@
+/**
+ * test_ascon.cpp — Test unitaire ASCON-AEAD128 sur ESP32
+ * Projet PCD — ENSI 2025/2026
+ *
+ * CE FICHIER EST COMPILÉ SEUL (sans main.cpp).
+ * Dans platformio.ini, ajouter la ligne :
+ *     src_filter = +<test_ascon.cpp>
+ * pour compiler ce test au lieu du code principal.
+ *
+ * ─────────────────────────────────────────────────────────
+ * PRINCIPE
+ * ─────────────────────────────────────────────────────────
+ * On hardcode 3 vecteurs KAT (Known Answer Test) calculés
+ * par la référence Python NIST SP 800-232 (ascon.py officiel).
+ *
+ * Pour chaque vecteur :
+ *   1. On appelle ascon_aead_encrypt() avec les mêmes paramètres
+ *   2. On compare le ciphertext produit byte-pour-byte avec CT attendu
+ *   3. On affiche PASS ou FAIL dans le Serial Monitor
+ *
+ * Si tous les tests passent → ascon.h est conforme NIST et
+ * compatible avec subscriber.py.
+ *
+ * ─────────────────────────────────────────────────────────
+ * PARAMÈTRES DES VECTEURS KAT
+ * ─────────────────────────────────────────────────────────
+ * Clé   : 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
+ * AD    : ENSI_IOT  (8 octets, sans terminaison nulle)
+ * Nonce : 10 11 12 13 14 15 16 17 18 19 1A 1B 00 00 00 XX
+ *         (les 4 derniers octets = numéro du KAT en big-endian)
+ *
+ * Plaintexts : JSON ECG réalistes, format identique au sprintf de main.cpp
+ *   {"id":N,"ecg":N,"bpm":N,"ip":"192.168.1.19","rssi":-60}
+ */
+ 
+#include <Arduino.h>
+#include "ascon.h"
+ 
+// ─────────────────────────────────────────────────────────────
+// UTILITAIRES
+// ─────────────────────────────────────────────────────────────
+ 
+/**
+ * printHex()
+ * But   : Affiche un tableau d'octets en hexadécimal dans le Serial Monitor.
+ * Rôle  : Outil de debug — permet de comparer visuellement produit et attendu.
+ * Params: label  = texte affiché avant les octets (ex: "CT produit  :")
+ *         data   = pointeur vers les octets à afficher
+ *         len    = nombre d'octets à afficher
+ */
+static void printHex(const char* label, const uint8_t* data, size_t len) {
+    Serial.print(label);
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] < 0x10) Serial.print("0");
+        Serial.print(data[i], HEX);
+    }
+    Serial.println();
+}
+ 
+/**
+ * compareBytes()
+ * But   : Compare deux tableaux d'octets et retourne true s'ils sont identiques.
+ * Rôle  : Remplace memcmp() avec un affichage de la première divergence trouvée,
+ *         ce qui facilite le diagnostic en cas d'échec.
+ * Params: a, b   = les deux tableaux à comparer
+ *         len    = longueur commune
+ * Retour: true si identiques, false sinon
+ */
+static bool compareBytes(const uint8_t* a, const uint8_t* b, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (a[i] != b[i]) {
+            Serial.printf("  [!] Premiere divergence a l'octet %d : produit=0x%02X attendu=0x%02X\n",
+                          (int)i, a[i], b[i]);
+            return false;
+        }
+    }
+    return true;
+}
+ 
+/**
+ * runKAT()
+ * But   : Exécute un seul vecteur KAT (chiffrement + comparaison).
+ * Rôle  : Fonction réutilisable pour tous les vecteurs.
+ *         Elle alloue dynamiquement le buffer ciphertext, appelle
+ *         ascon_aead_encrypt(), compare avec l'attendu, puis libère la mémoire.
+ * Params: kat_num     = numéro du KAT (pour l'affichage)
+ *         key         = clé 16 octets
+ *         nonce       = nonce 16 octets
+ *         ad, adlen   = données associées
+ *         pt, ptlen   = plaintext
+ *         ct_expected = ciphertext attendu (ptlen + 16 octets)
+ * Retour: true si le KAT passe, false sinon
+ */
+static bool runKAT(int kat_num,
+                   const uint8_t* key,
+                   const uint8_t* nonce,
+                   const uint8_t* ad, size_t adlen,
+                   const uint8_t* pt, size_t ptlen,
+                   const uint8_t* ct_expected)
+{
+    Serial.printf("\n─── KAT #%d ───────────────────────────────────────\n", kat_num);
+    Serial.printf("  Plaintext (%d octets) : %s\n", (int)ptlen, (const char*)pt);
+    printHex("  Nonce     : ", nonce, ASCON_NONCE_LEN);
+    printHex("  CT attendu: ", ct_expected, ptlen + ASCON_TAG_LEN);
+ 
+    // Allouer le buffer de sortie : taille ciphertext = ptlen + tag (16 octets)
+    size_t ctlen = ptlen + ASCON_TAG_LEN;
+    uint8_t* ct_produced = (uint8_t*)malloc(ctlen);
+    if (!ct_produced) {
+        Serial.println("  [!] Erreur malloc — mémoire insuffisante");
+        return false;
+    }
+ 
+    // Chiffrement ASCON-AEAD128
+    ascon_aead_encrypt(key, nonce, ad, adlen, pt, ptlen, ct_produced);
+ 
+    // Affichage du ciphertext produit
+    printHex("  CT produit: ", ct_produced, ctlen);
+ 
+    // Comparaison byte-pour-byte
+    bool pass = compareBytes(ct_produced, ct_expected, ctlen);
+    free(ct_produced);
+ 
+    Serial.printf("  Résultat  : %s\n", pass ? "✅ PASS" : "❌ FAIL");
+    return pass;
+}
+ 
+ 
+// ─────────────────────────────────────────────────────────────
+// VECTEURS KAT (calculés par ascon.py NIST SP 800-232)
+// ─────────────────────────────────────────────────────────────
+ 
+// Clé commune à tous les vecteurs
+static const uint8_t KAT_KEY[ASCON_KEY_LEN] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+ 
+// Données associées communes (identiques à main.cpp)
+static const uint8_t KAT_AD[8]  = {'E','N','S','I','_','I','O','T'};
+static const size_t  KAT_ADLEN  = 8;
+ 
+// ── KAT #1 ────────────────────────────────────────────────────
+// PT : {"id":1,"ecg":2058,"bpm":100,"ip":"192.168.1.19","rssi":-60}
+static const uint8_t KAT1_NONCE[ASCON_NONCE_LEN] = {
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+    0x18,0x19,0x1A,0x1B, 0x00,0x00,0x00,0x01
+};
+static const uint8_t KAT1_PT[] =
+    "{\"id\":1,\"ecg\":2058,\"bpm\":100,\"ip\":\"192.168.1.19\",\"rssi\":-60}";
+// 60 octets de plaintext + 16 octets de tag = 76 octets au total
+static const uint8_t KAT1_CT[76] = {
+    0x07,0xD6,0xB8,0xEF,0x9A,0x12,0x52,0x9E,0x84,0x4B,0x8C,0x6A,0x91,0xCF,0x45,0x98,
+    0x23,0x29,0x00,0xD0,0x6B,0xE2,0x52,0x91,0xD0,0x31,0x8E,0x6F,0x21,0xCD,0x63,0xD4,
+    0x6C,0x8A,0xB1,0xAB,0x12,0xE5,0xC4,0x93,0x56,0xD5,0x9B,0x3C,0xDF,0x88,0x1A,0x0F,
+    0x8F,0xCB,0xBC,0x19,0xFA,0xA6,0x31,0x9B,0x32,0x7F,0x5F,0x89,0xC1,0x5B,0x13,0x71,
+    0x62,0x45,0x38,0xB4,0xB5,0xD2,0x11,0x3B,0xFD,0xB4,0x5D,0x5E
+};
+ 
+// ── KAT #21 ───────────────────────────────────────────────────
+// PT : {"id":21,"ecg":2046,"bpm":70,"ip":"192.168.1.19","rssi":-60}
+static const uint8_t KAT2_NONCE[ASCON_NONCE_LEN] = {
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+    0x18,0x19,0x1A,0x1B, 0x00,0x00,0x00,0x15  // 0x15 = 21
+};
+static const uint8_t KAT2_PT[] =
+    "{\"id\":21,\"ecg\":2046,\"bpm\":70,\"ip\":\"192.168.1.19\",\"rssi\":-60}";
+// 60 octets de plaintext + 16 octets de tag = 76 octets
+static const uint8_t KAT2_CT[76] = {
+    0x31,0x9A,0x4F,0x61,0x55,0x9B,0x04,0xE8,0xB9,0x4E,0xFB,0xE6,0x10,0x25,0x98,0x15,
+    0x02,0x5D,0x0A,0xFA,0x37,0x1C,0xFB,0x26,0x40,0xF1,0xB8,0x65,0x05,0x68,0xE7,0xA1,
+    0x4A,0x37,0x91,0x45,0xFE,0x59,0xBE,0xB7,0xDD,0x33,0x2A,0x15,0x67,0x49,0x59,0x1A,
+    0x53,0x7C,0x15,0x82,0xDC,0x70,0xFD,0xB6,0x44,0x9A,0x26,0x03,0x49,0xA2,0x98,0xD6,
+    0x97,0x9C,0x69,0x26,0x3B,0xDB,0xD8,0x0A,0xB9,0xED,0xCC,0xE2
+};
+ 
+// ── KAT #41 ───────────────────────────────────────────────────
+// PT : {"id":41,"ecg":2647,"bpm":62,"ip":"192.168.1.19","rssi":-60}
+static const uint8_t KAT3_NONCE[ASCON_NONCE_LEN] = {
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+    0x18,0x19,0x1A,0x1B, 0x00,0x00,0x00,0x29  // 0x29 = 41
+};
+static const uint8_t KAT3_PT[] =
+    "{\"id\":41,\"ecg\":2647,\"bpm\":62,\"ip\":\"192.168.1.19\",\"rssi\":-60}";
+// 60 octets de plaintext + 16 octets de tag = 76 octets
+static const uint8_t KAT3_CT[76] = {
+    0xB5,0x52,0xFF,0x9D,0xE9,0xF3,0xE8,0x30,0x14,0xE3,0xA8,0xEF,0x86,0xBD,0x0B,0xC6,
+    0x76,0xE9,0xB8,0x1F,0x62,0xF3,0x0C,0x63,0xA9,0x49,0x6D,0xD3,0xEA,0xDC,0x43,0xC6,
+    0x08,0x23,0x6C,0xED,0xD4,0x0A,0xAA,0xE0,0x8C,0xB9,0x51,0xFE,0x32,0x89,0x34,0x8F,
+    0x82,0x61,0x59,0x0D,0x1A,0xF8,0xCB,0xC6,0x0B,0xAE,0x18,0x9F,0x80,0x53,0x56,0x39,
+    0x81,0x83,0x8E,0x9E,0x5F,0x3C,0x4F,0x8B,0x0D,0xDC,0x94,0xE8
+};
+ 
+ 
+// ─────────────────────────────────────────────────────────────
+// SETUP : point d'entrée du programme de test
+// ─────────────────────────────────────────────────────────────
+ 
+void setup() {
+    Serial.begin(115200);
+    delay(2000);  // attendre que le Serial Monitor soit prêt
+ 
+    Serial.println("\n==================================================");
+    Serial.println("  ASCON-AEAD128 KAT Test — NIST SP 800-232");
+    Serial.println("  Projet PCD ENSI 2025/2026");
+    Serial.println("==================================================");
+    Serial.printf("  Clé   : ");
+    for (int i = 0; i < 16; i++) { Serial.printf("%02X", KAT_KEY[i]); }
+    Serial.println();
+    Serial.printf("  AD    : ENSI_IOT (%d octets)\n", (int)KAT_ADLEN);
+ 
+    int passed = 0;
+    int total  = 3;
+ 
+    // ── Exécution des 3 KAT ────────────────────────────────────
+    // ptlen = strlen(KAT1_PT) = 60 octets
+    // (on utilise sizeof-1 pour exclure le '\0' terminal du string literal C++)
+ 
+    if (runKAT(1,
+               KAT_KEY, KAT1_NONCE,
+               KAT_AD, KAT_ADLEN,
+               KAT1_PT, sizeof(KAT1_PT)-1,
+               KAT1_CT)) passed++;
+ 
+    if (runKAT(21,
+               KAT_KEY, KAT2_NONCE,
+               KAT_AD, KAT_ADLEN,
+               KAT2_PT, sizeof(KAT2_PT)-1,
+               KAT2_CT)) passed++;
+ 
+    if (runKAT(41,
+               KAT_KEY, KAT3_NONCE,
+               KAT_AD, KAT_ADLEN,
+               KAT3_PT, sizeof(KAT3_PT)-1,
+               KAT3_CT)) passed++;
+ 
+    // ── Résultat final ─────────────────────────────────────────
+    Serial.println("\n==================================================");
+    Serial.printf("  RÉSULTAT : %d / %d KAT passés\n", passed, total);
+    if (passed == total) {
+        Serial.println("  ✅ ASCON conforme NIST SP 800-232");
+        Serial.println("  Le chiffrement ESP32 est compatible avec subscriber.py");
+    } else {
+        Serial.println("  ❌ ASCON NON conforme — vérifier ascon.h");
+    }
+    Serial.println("==================================================\n");
+}
+ 
+// loop() vide : le test s'exécute une seule fois dans setup()
+void loop() {
+    delay(10000);
+}

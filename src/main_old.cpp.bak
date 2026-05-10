@@ -1,0 +1,275 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "ascon.h"
+#include "test.h"
+
+// CONFIGURATION WIFI & MQTT
+
+const char* ssid        = "TOPNET_CEC8";
+const char* password    = "keylol9922";
+const char* mqtt_server = "192.168.1.19";
+
+
+
+// TOPICS MQTT (ADAPTÉS POUR ECG)
+
+const char* topic_pub    = "iot/sensor/ecg";      // Données ECG chiffrées
+const char* topic_status = "iot/esp32/status";    // Statut ESP32
+
+
+// TIMERS (IMPORTANT : Deux vitesses différentes)
+
+const int ECG_READ_INTERVAL = 10;   // 10ms (100 Hz )
+const int MQTT_PUB_INTERVAL = 50;   // 50ms (20 Hz) pour MQTT
+unsigned long lastEcgRead = 0;
+unsigned long lastMqttPub = 0;
+
+const uint8_t ASCON_KEY[ASCON_KEY_LEN] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+
+// Données associées (authentification du contexte) - sans terminaison nulle
+const uint8_t AD[8]  = {'E', 'N', 'S', 'I', '_', 'I', 'O', 'T'};
+const size_t  ADLEN = 8;
+
+
+// MQTT CLIENT
+WiFiClient   espClient;
+PubSubClient client(espClient);
+int          compteur = 0;
+unsigned long lastMsg = 0;
+
+// =====================================================
+// UTILITAIRES
+// =====================================================
+
+// Convertit bytes → hex string (pour debug)
+String toHex(const uint8_t* data, size_t len) {
+    String out = "";
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] < 0x10) out += "0";
+        out += String(data[i], HEX);
+    }
+    return out;
+}
+
+// Encode bytes en Base64
+static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+String base64Encode(const uint8_t* data, size_t len) {
+    String out = "";
+    int i = 0;
+    uint8_t buf3[3], buf4[4];
+    while (len--) {
+        buf3[i++] = *data++;
+        if (i == 3) {
+            buf4[0] = (buf3[0] & 0xfc) >> 2;
+            buf4[1] = ((buf3[0] & 0x03) << 4) + ((buf3[1] & 0xf0) >> 4);
+            buf4[2] = ((buf3[1] & 0x0f) << 2) + ((buf3[2] & 0xc0) >> 6);
+            buf4[3] = buf3[2] & 0x3f;
+            for (int k = 0; k < 4; k++) out += b64chars[buf4[k]];
+            i = 0;
+        }
+    }
+    if (i) {
+        for (int j = i; j < 3; j++) buf3[j] = 0;
+        buf4[0] = (buf3[0] & 0xfc) >> 2;
+        buf4[1] = ((buf3[0] & 0x03) << 4) + ((buf3[1] & 0xf0) >> 4);
+        buf4[2] = ((buf3[1] & 0x0f) << 2) + ((buf3[2] & 0xc0) >> 6);
+        buf4[3] = buf3[2] & 0x3f;
+        for (int k = 0; k < i + 1; k++) out += b64chars[buf4[k]];
+        while (i++ < 3) out += '=';
+    }
+    return out;
+}
+
+// =====================================================
+// CHIFFREMENT ASCON + PUBLICATION MQTT
+// =====================================================
+void publishEncrypted(const char* topic, const char* plaintext) {
+    size_t ptlen = strlen(plaintext);
+
+    // 1. Générer nonce aléatoire 16 octets
+    uint8_t nonce[ASCON_NONCE_LEN];
+    esp_fill_random(nonce, ASCON_NONCE_LEN);
+
+    // 2. Buffer ciphertext = ptlen + 16 (tag)
+    size_t ctlen = ptlen + ASCON_TAG_LEN;
+    uint8_t* ciphertext = (uint8_t*)malloc(ctlen);
+    if (!ciphertext) {
+        Serial.println("[ASCON] Erreur malloc ciphertext");
+        return;
+    }
+
+    // 3. Chiffrement ASCON-AEAD128
+    unsigned long t0 = micros();
+    ascon_aead_encrypt(ASCON_KEY, nonce, AD, ADLEN,
+                       (const uint8_t*)plaintext, ptlen,
+                       ciphertext);
+    unsigned long elapsed = micros() - t0;
+
+    Serial.printf("[ASCON] Chiffrement: %lu us (%.2f ms)", elapsed, elapsed / 1000.0);
+    if (elapsed > 10000) {
+        Serial.println("  > 10ms !");
+    } else {
+        Serial.println(" ok");
+    }
+
+    // 4. Encoder nonce + ciphertext en Base64
+    size_t totalLen = ASCON_NONCE_LEN + ctlen;
+    uint8_t* fullPacket = (uint8_t*)malloc(totalLen);
+    if (!fullPacket) {
+        free(ciphertext);
+        Serial.println("[ASCON] Erreur malloc fullPacket");
+        return;
+    }
+    memcpy(fullPacket,                  nonce,      ASCON_NONCE_LEN);
+    memcpy(fullPacket + ASCON_NONCE_LEN, ciphertext, ctlen);
+
+    String b64 = base64Encode(fullPacket, totalLen);
+
+    // 5. Debug
+    Serial.println("[ASCON] Plaintext  : " + String(plaintext));
+    Serial.println("[ASCON] Payload B64: " + b64);
+    
+    // 🔍 DEBUG HEX: Afficher nonce, ciphertext, tag en détail
+    Serial.println("[DEBUG] Paramètres d'envoi:");
+    Serial.print("[DEBUG] Nonce (hex): ");
+    for (int i = 0; i < ASCON_NONCE_LEN; i++) {
+        if (nonce[i] < 16) Serial.print("0");
+        Serial.print(nonce[i], HEX);
+    }
+    Serial.println();
+    
+    // Ciphertext = plaintext_chiffré (ptlen) || tag (16)
+    Serial.print("[DEBUG] Ciphertext (hex, premiers 40 bytes): ");
+    size_t maxDebugLen = (ctlen > 40) ? 40 : ctlen;
+    for (size_t i = 0; i < maxDebugLen; i++) {
+        if (ciphertext[i] < 16) Serial.print("0");
+        Serial.print(ciphertext[i], HEX);
+    }
+    if (ctlen > 40) Serial.print("...");
+    Serial.println();
+    
+    // Afficher le tag séparé
+    Serial.print("[DEBUG] Tag (hex, derniers 16 bytes): ");
+    for (size_t i = ptlen; i < ptlen + 16; i++) {
+        if (ciphertext[i] < 16) Serial.print("0");
+        Serial.print(ciphertext[i], HEX);
+    }
+    Serial.println();
+    
+    Serial.println("[DEBUG] Taille: plaintext=" + String(ptlen) + ", ciphertext+tag=" + String(ctlen));
+    Serial.println();
+
+    // 6. Publication MQTT
+    client.publish(topic, b64.c_str());
+
+    free(ciphertext);
+    free(fullPacket);
+}
+
+
+// CALLBACK MQTT (réception commandes)
+
+void callback(char* topic, byte* payload, unsigned int length) {
+    String msg = "";
+    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+    Serial.println(">>> [MQTT] Topic: " + String(topic) + " | Msg: " + msg);
+    
+}
+
+
+// RECONNEXION AUTOMATIQUE
+
+void reconnect() {
+    while (!client.connected()) {
+        Serial.print("[MQTT] Connexion au broker...");
+        if (client.connect("ESP32_ECG_Sensor")) {
+            Serial.println(" Connecte !");
+            client.publish(topic_status, "ESP32 ECG en ligne");
+        } else {
+            Serial.print(" Echec (rc=");
+            Serial.print(client.state());
+            Serial.println(") — reessai dans 5s...");
+            delay(5000);
+        }
+    }
+}
+
+// SETUP
+
+void setup() {
+    Serial.begin(115200);
+    // 1. INITIALISATION DU CAPTEUR (Appelle la fonction de test.h)
+
+    setupECG();
+    Serial.println();
+    Serial.println("==================================================");
+    Serial.println("  ESP32 + Capteur ECG AD8232 + ASCON-AEAD128");
+    Serial.println("==================================================");
+
+    // Connexion WiFi
+    Serial.print("\n[WIFI] Connexion a: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\n[WIFI] Connecte ! IP: " + WiFi.localIP().toString());
+
+    // Configuration MQTT
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(callback);
+    client.setBufferSize(512);  // Payload Base64 peut etre long
+
+    Serial.println("\n[SYS] Pret a publier les donnees ECG sur: " + String(topic_pub));
+    
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+    // Gestion connexion MQTT
+    if (!client.connected()) {
+        reconnect();
+    }
+    client.loop();
+
+    // Publication périodique des données ECG
+    unsigned long now = millis();
+
+   // --- TÂCHE A : LECTURE DU CAPTEUR (Très rapide) ---
+    if (now - lastEcgRead >= ECG_READ_INTERVAL) {
+        lastEcgRead = now;
+        updateECG(); // Calcule le filtre et le BPM dans test.h
+    }
+
+    // --- TÂCHE B : ENVOI MQTT (Plus lent) ---
+    if (now - lastMqttPub >= MQTT_PUB_INTERVAL) {
+        lastMqttPub = now;
+        compteur++;
+        
+        // RÉCUPÉRATION DES VALEURS DEPUIS test.h
+        int ecgVal = getECGValue();
+        int bpmVal = getBPMValue();
+
+        // CONSTRUCTION DU JSON (Ajout du champ "bpm")
+        char plaintext[128];
+        sprintf(plaintext,
+            "{\"id\":%d,\"ecg\":%d,\"bpm\":%d,\"ip\":\"%s\",\"rssi\":%ld}",
+            compteur,
+            ecgVal,
+            bpmVal,
+            WiFi.localIP().toString().c_str(),
+            (long)WiFi.RSSI()
+        );
+
+        // CHIFFREMENT ASCON ET ENVOI
+        publishEncrypted(topic_pub, plaintext);
+    }
+}
