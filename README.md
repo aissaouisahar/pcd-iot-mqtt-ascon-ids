@@ -27,7 +27,7 @@ ESP32 + AD8232 (Publisher)
    └─ Frontend React
 \`\`\`
 
-## Innovation : filtre IA intermédiaire
+## Innovation : Le modèle IA pour detection des attaques 
 
 Le modèle IA fait office de **filtre** entre le capteur et l'application : il analyse chaque message ECG, détecte les attaques (DoS, MitM, Bruteforce, anomalies) et ne laisse passer que les données saines vers l'application finale.
 
